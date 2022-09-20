@@ -20,7 +20,7 @@
 #pragma warning(disable : 4996) /* The POSIX name is deprecated... */
 #endif                          /* _MSC_VER (warnings) */
 
-#define xMDBX_TOOLS /* Avoid using internal mdbx_assert() */
+#define xMDBX_TOOLS /* Avoid using internal eASSERT() */
 #include "internals.h"
 
 typedef struct flagbit {
@@ -93,7 +93,7 @@ struct {
 #define dbi_main walk.dbi[MAIN_DBI]
 #define dbi_meta walk.dbi[CORE_DBS]
 
-int envflags = MDBX_RDONLY | MDBX_EXCLUSIVE;
+int envflags = MDBX_RDONLY | MDBX_EXCLUSIVE | MDBX_VALIDATION;
 MDBX_env *env;
 MDBX_txn *txn;
 MDBX_envinfo envinfo;
@@ -125,7 +125,8 @@ static void MDBX_PRINTF_ARGS(1, 2) print(const char *msg, ...) {
   }
 }
 
-static void va_log(MDBX_log_level_t level, const char *msg, va_list args) {
+static void va_log(MDBX_log_level_t level, const char *function, int line,
+                   const char *msg, va_list args) {
   static const char *const prefixes[] = {
       "!!!fatal: ",       " ! " /* error */,      " ~ " /* warning */,
       "   " /* notice */, "   // " /* verbose */, "   //// " /* debug */,
@@ -143,13 +144,20 @@ static void va_log(MDBX_log_level_t level, const char *msg, va_list args) {
     fflush(nullptr);
     fputs(prefixes[level], out);
     vfprintf(out, msg, args);
-    if (msg[strlen(msg) - 1] != '\n')
+
+    const bool have_lf = msg[strlen(msg) - 1] == '\n';
+    if (level == MDBX_LOG_FATAL && function && line)
+      fprintf(out, have_lf ? "          %s(), %u\n" : " (%s:%u)\n",
+              function + (strncmp(function, "mdbx_", 5) ? 5 : 0), line);
+    else if (!have_lf)
       fputc('\n', out);
     fflush(nullptr);
   }
 
   if (level == MDBX_LOG_FATAL) {
+#if !MDBX_DEBUG && !MDBX_FORCE_ASSERTIONS
     exit(EXIT_FAILURE_MDBX);
+#endif
     abort();
   }
 }
@@ -157,7 +165,7 @@ static void va_log(MDBX_log_level_t level, const char *msg, va_list args) {
 static void MDBX_PRINTF_ARGS(1, 2) error(const char *msg, ...) {
   va_list args;
   va_start(args, msg);
-  va_log(MDBX_LOG_ERROR, msg, args);
+  va_log(MDBX_LOG_ERROR, nullptr, 0, msg, args);
   va_end(args);
 }
 
@@ -166,7 +174,7 @@ static void logger(MDBX_log_level_t level, const char *function, int line,
   (void)line;
   (void)function;
   if (level < MDBX_LOG_EXTRA)
-    va_log(level, msg, args);
+    va_log(level, function, line, msg, args);
 }
 
 static int check_user_break(void) {
@@ -185,12 +193,12 @@ static void pagemap_cleanup(void) {
   for (size_t i = CORE_DBS + /* account pseudo-entry for meta */ 1;
        i < ARRAY_LENGTH(walk.dbi); ++i) {
     if (walk.dbi[i].name) {
-      mdbx_free((void *)walk.dbi[i].name);
+      osal_free((void *)walk.dbi[i].name);
       walk.dbi[i].name = nullptr;
     }
   }
 
-  mdbx_free(walk.pagemap);
+  osal_free(walk.pagemap);
   walk.pagemap = nullptr;
 }
 
@@ -221,7 +229,7 @@ static walk_dbi_t *pagemap_lookup_dbi(const char *dbi_name, bool silent) {
   if (dbi == ARRAY_END(walk.dbi))
     return nullptr;
 
-  dbi->name = mdbx_strdup(dbi_name);
+  dbi->name = osal_strdup(dbi_name);
   return last = dbi;
 }
 
@@ -239,7 +247,7 @@ static void MDBX_PRINTF_ARGS(4, 5)
         break;
 
     if (!p) {
-      p = mdbx_calloc(1, sizeof(*p));
+      p = osal_calloc(1, sizeof(*p));
       if (unlikely(!p))
         return;
       p->caption = msg;
@@ -284,7 +292,7 @@ static size_t problems_pop(struct problem *list) {
       count += problems_list->count;
       print("%s%s (%" PRIuPTR ")", i ? ", " : "", problems_list->caption,
             problems_list->count);
-      mdbx_free(problems_list);
+      osal_free(problems_list);
       problems_list = p;
     }
     print("\n");
@@ -521,7 +529,7 @@ static int handle_freedb(const uint64_t record_number, const MDBX_val *key,
         number = data->iov_len / sizeof(pgno_t) - 1;
       } else if (data->iov_len - (number + 1) * sizeof(pgno_t) >=
                  /* LY: allow gap up to one page. it is ok
-                  * and better than shink-and-retry inside mdbx_update_gc() */
+                  * and better than shink-and-retry inside update_gc() */
                  envinfo.mi_dxb_pagesize)
         problem_add("entry", txnid, "extra idl space",
                     "%" PRIuSIZE " < %" PRIuSIZE " (minor, not a trouble)",
@@ -618,7 +626,7 @@ static int handle_maindb(const uint64_t record_number, const MDBX_val *key,
       return handle_userdb(record_number, key, data);
   }
 
-  name = mdbx_malloc(key->iov_len + 1);
+  name = osal_malloc(key->iov_len + 1);
   if (unlikely(!name))
     return MDBX_ENOMEM;
   memcpy(name, key->iov_base, key->iov_len);
@@ -626,7 +634,7 @@ static int handle_maindb(const uint64_t record_number, const MDBX_val *key,
   userdb_count++;
 
   rc = process_db(~0u, name, handle_userdb, false);
-  mdbx_free(name);
+  osal_free(name);
   if (rc != MDBX_INCOMPATIBLE)
     return rc;
 
@@ -805,9 +813,9 @@ static int process_db(MDBX_dbi dbi_handle, char *dbi_name, visitor *handler,
   }
 
   if (ignore_wrong_order) { /* for debugging with enabled assertions */
-    mc->mc_flags |= C_SKIPORD;
+    mc->mc_checking |= CC_SKIPORD;
     if (mc->mc_xcursor)
-      mc->mc_xcursor->mx_cursor.mc_flags |= C_SKIPORD;
+      mc->mc_xcursor->mx_cursor.mc_checking |= CC_SKIPORD;
   }
 
   const size_t maxkeysize = mdbx_env_get_maxkeysize_ex(env, flags);
@@ -1231,7 +1239,9 @@ int main(int argc, char *argv[]) {
   mdbx_setup_debug((verbose < MDBX_LOG_TRACE - 1)
                        ? (MDBX_log_level_t)(verbose + 1)
                        : MDBX_LOG_TRACE,
-                   MDBX_DBG_LEGACY_OVERLAP | MDBX_DBG_DONT_UPGRADE, logger);
+                   MDBX_DBG_DUMP | MDBX_DBG_ASSERT | MDBX_DBG_AUDIT |
+                       MDBX_DBG_LEGACY_OVERLAP | MDBX_DBG_DONT_UPGRADE,
+                   logger);
 
   rc = mdbx_env_create(&env);
   if (rc) {
@@ -1330,7 +1340,7 @@ int main(int argc, char *argv[]) {
   }
 #endif
   if (rc) {
-    error("mdbx_filesize() failed, error %d %s\n", rc, mdbx_strerror(rc));
+    error("osal_filesize() failed, error %d %s\n", rc, mdbx_strerror(rc));
     goto bailout;
   }
 
@@ -1494,7 +1504,7 @@ int main(int argc, char *argv[]) {
 
     print("Traversal b-tree by txn#%" PRIaTXN "...\n", txn->mt_txnid);
     fflush(nullptr);
-    walk.pagemap = mdbx_calloc((size_t)backed_pages, sizeof(*walk.pagemap));
+    walk.pagemap = osal_calloc((size_t)backed_pages, sizeof(*walk.pagemap));
     if (!walk.pagemap) {
       rc = errno ? errno : MDBX_ENOMEM;
       error("calloc() failed, error %d %s\n", rc, mdbx_strerror(rc));

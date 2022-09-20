@@ -224,17 +224,12 @@
 
 #ifndef MDBX_HAVE_CXX20_CONCEPTS
 #if defined(DOXYGEN) ||                                                        \
-    (defined(__cpp_concepts) && __cpp_concepts >= 201907L &&                   \
-     (!defined(__clang__) || __has_include(<concepts>) ||                      \
-  (defined(__cpp_lib_concepts) && __cpp_lib_concepts >= 202002L)))
-#if __has_include(<concepts>) ||                                               \
-  (defined(__cpp_lib_concepts) && __cpp_lib_concepts >= 202002L)
+    (defined(__cpp_lib_concepts) && __cpp_lib_concepts >= 202002L)
 #include <concepts>
-#endif /* <concepts> */
 #define MDBX_HAVE_CXX20_CONCEPTS 1
 #else
 #define MDBX_HAVE_CXX20_CONCEPTS 0
-#endif
+#endif /* <concepts> */
 #endif /* MDBX_HAVE_CXX20_CONCEPTS */
 
 #ifndef MDBX_CXX20_CONCEPT
@@ -267,6 +262,16 @@
  * optimization (copy elision, etc). */
 #pragma warning(disable : 4702) /* unreachable code */
 #endif                          /* _MSC_VER (warnings) */
+
+#if defined(__LCC__) && __LCC__ >= 126
+#pragma diagnostic push
+#if __LCC__ < 127
+#pragma diag_suppress 3058 /* workaround: call to is_constant_evaluated()      \
+                              appearing in a constant expression `true` */
+#pragma diag_suppress 3060 /* workaround: call to is_constant_evaluated()      \
+                              appearing in a constant expression `false` */
+#endif
+#endif /* E2K LCC (warnings) */
 
 //------------------------------------------------------------------------------
 /// \brief The libmdbx C++ API namespace
@@ -314,8 +319,15 @@ using build_info = ::MDBX_build_info;
 /// \brief Returns libmdbx build information.
 MDBX_CXX11_CONSTEXPR const build_info &get_build() noexcept;
 
-/// \brief constexpr-compatible strlen().
+/// \brief constexpr-enabled strlen().
 static MDBX_CXX17_CONSTEXPR size_t strlen(const char *c_str) noexcept;
+
+/// \brief constexpr-enabled memcpy().
+static MDBX_CXX20_CONSTEXPR void *memcpy(void *dest, const void *src,
+                                         size_t bytes) noexcept;
+/// \brief constexpr-enabled memcmp().
+static MDBX_CXX20_CONSTEXPR int memcmp(const void *a, const void *b,
+                                       size_t bytes) noexcept;
 
 /// \brief Legacy default allocator
 /// but it is recommended to use \ref polymorphic_allocator.
@@ -534,9 +546,6 @@ static MDBX_CXX14_CONSTEXPR size_t check_length(size_t headroom, size_t payload,
 
 /// end of cxx_exceptions @}
 
-static MDBX_CXX17_CONSTEXPR size_t strlen(const char *c_str) noexcept;
-static MDBX_CXX20_CONSTEXPR void *memcpy(void *dest, const void *src,
-                                         size_t bytes) noexcept;
 //------------------------------------------------------------------------------
 
 /// \defgroup cxx_data slices and buffers
@@ -956,20 +965,21 @@ struct LIBMDBX_API_TYPE slice : public ::MDBX_val {
   hash_value() const noexcept;
 
   /// \brief Three-way fast non-lexicographically length-based comparison.
-  /// \return value:
-  ///   == 0 if "a" == "b",
-  ///   <  0 if "a" shorter than "b",
-  ///   >  0 if "a" longer than "b",
-  ///   <  0 if "a" length-equal and lexicographically less than "b",
-  ///   >  0 if "a" length-equal and lexicographically great than "b".
+  /// \details Firstly compares length and if it equal then compare content
+  /// lexicographically. \return value:
+  ///  `== 0` if `a` the same as `b`;
+  ///   `< 0` if `a` shorter than `b`,
+  ///             or the same length and lexicographically less than `b`;
+  ///   `> 0` if `a` longer than `b`,
+  ///             or the same length and lexicographically great than `b`.
   MDBX_NOTHROW_PURE_FUNCTION static MDBX_CXX14_CONSTEXPR intptr_t
   compare_fast(const slice &a, const slice &b) noexcept;
 
   /// \brief Three-way lexicographically comparison.
   /// \return value:
-  ///   <  0 if "a" <  "b",
-  ///   == 0 if "a" == "b",
-  ///   >  0 if "a" >  "b".
+  ///  `== 0` if `a` lexicographically equal `b`;
+  ///   `< 0` if `a` lexicographically less than `b`;
+  ///   `> 0` if `a` lexicographically great than `b`.
   MDBX_NOTHROW_PURE_FUNCTION static MDBX_CXX14_CONSTEXPR intptr_t
   compare_lexicographically(const slice &a, const slice &b) noexcept;
   friend MDBX_CXX14_CONSTEXPR bool operator==(const slice &a,
@@ -3215,8 +3225,12 @@ public:
 #if defined(_WIN32) || defined(_WIN64) || defined(DOXYGEN)
   env &copy(const ::std::wstring &destination, bool compactify,
             bool force_dynamic_size = false);
+  env &copy(const wchar_t *destination, bool compactify,
+            bool force_dynamic_size = false);
 #endif /* Windows */
   env &copy(const ::std::string &destination, bool compactify,
+            bool force_dynamic_size = false);
+  env &copy(const char *destination, bool compactify,
             bool force_dynamic_size = false);
 
   /// \brief Copy an environment to the specified file descriptor.
@@ -3242,14 +3256,18 @@ public:
   /// \brief Removes the environment's files in a proper and multiprocess-safe
   /// way.
 #ifdef MDBX_STD_FILESYSTEM_PATH
-  static bool remove(const MDBX_STD_FILESYSTEM_PATH &,
+  static bool remove(const MDBX_STD_FILESYSTEM_PATH &pathname,
                      const remove_mode mode = just_remove);
 #endif /* MDBX_STD_FILESYSTEM_PATH */
 #if defined(_WIN32) || defined(_WIN64) || defined(DOXYGEN)
-  static bool remove(const ::std::wstring &,
+  static bool remove(const ::std::wstring &pathname,
+                     const remove_mode mode = just_remove);
+  static bool remove(const wchar_t *pathname,
                      const remove_mode mode = just_remove);
 #endif /* Windows */
-  static bool remove(const ::std::string &,
+  static bool remove(const ::std::string &pathname,
+                     const remove_mode mode = just_remove);
+  static bool remove(const char *pathname,
                      const remove_mode mode = just_remove);
 
   /// \brief Statistics for a database in the MDBX environment.
@@ -3487,15 +3505,19 @@ public:
 
   /// \brief Open existing database.
 #ifdef MDBX_STD_FILESYSTEM_PATH
-  env_managed(const MDBX_STD_FILESYSTEM_PATH &, const operate_parameters &,
-              bool accede = true);
+  env_managed(const MDBX_STD_FILESYSTEM_PATH &pathname,
+              const operate_parameters &, bool accede = true);
 #endif /* MDBX_STD_FILESYSTEM_PATH */
 #if defined(_WIN32) || defined(_WIN64) || defined(DOXYGEN)
-  env_managed(const ::std::wstring &, const operate_parameters &,
+  env_managed(const ::std::wstring &pathname, const operate_parameters &,
               bool accede = true);
+  explicit env_managed(const wchar_t *pathname, const operate_parameters &,
+                       bool accede = true);
 #endif /* Windows */
-  env_managed(const ::std::string &, const operate_parameters &,
+  env_managed(const ::std::string &pathname, const operate_parameters &,
               bool accede = true);
+  explicit env_managed(const char *pathname, const operate_parameters &,
+                       bool accede = true);
 
   /// \brief Additional parameters for creating a new database.
   struct create_parameters {
@@ -3508,15 +3530,20 @@ public:
 
   /// \brief Create new or open existing database.
 #ifdef MDBX_STD_FILESYSTEM_PATH
-  env_managed(const MDBX_STD_FILESYSTEM_PATH &, const create_parameters &,
-              const operate_parameters &, bool accede = true);
+  env_managed(const MDBX_STD_FILESYSTEM_PATH &pathname,
+              const create_parameters &, const operate_parameters &,
+              bool accede = true);
 #endif /* MDBX_STD_FILESYSTEM_PATH */
 #if defined(_WIN32) || defined(_WIN64) || defined(DOXYGEN)
-  env_managed(const ::std::wstring &, const create_parameters &,
+  env_managed(const ::std::wstring &pathname, const create_parameters &,
               const operate_parameters &, bool accede = true);
+  explicit env_managed(const wchar_t *pathname, const create_parameters &,
+                       const operate_parameters &, bool accede = true);
 #endif /* Windows */
-  env_managed(const ::std::string &, const create_parameters &,
+  env_managed(const ::std::string &pathname, const create_parameters &,
               const operate_parameters &, bool accede = true);
+  explicit env_managed(const char *pathname, const create_parameters &,
+                       const operate_parameters &, bool accede = true);
 
   /// \brief Explicitly closes the environment and release the memory map.
   ///
@@ -6014,6 +6041,10 @@ template <> struct hash<::mdbx::slice> {
 
 /// end cxx_api @}
 } // namespace std
+
+#if defined(__LCC__) && __LCC__ >= 126
+#pragma diagnostic pop
+#endif
 
 #ifdef _MSC_VER
 #pragma warning(pop)

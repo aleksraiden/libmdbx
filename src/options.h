@@ -80,6 +80,18 @@
 #error MDBX_ENABLE_PGOP_STAT must be defined as 0 or 1
 #endif /* MDBX_ENABLE_PGOP_STAT */
 
+/** Enables chunking long list of retired pages during huge transactions commit
+ * to avoid use sequences of pages. */
+#ifndef MDBX_ENABLE_BIGFOOT
+#if MDBX_WORDBITS >= 64 || defined(DOXYGEN)
+#define MDBX_ENABLE_BIGFOOT 1
+#else
+#define MDBX_ENABLE_BIGFOOT 0
+#endif
+#elif !(MDBX_ENABLE_BIGFOOT == 0 || MDBX_ENABLE_BIGFOOT == 1)
+#error MDBX_ENABLE_BIGFOOT must be defined as 0 or 1
+#endif /* MDBX_ENABLE_BIGFOOT */
+
 /** Controls use of POSIX madvise() hints and friends. */
 #ifndef MDBX_ENABLE_MADVISE
 #define MDBX_ENABLE_MADVISE 1
@@ -89,11 +101,11 @@
 
 /** Disable some checks to reduce an overhead and detection probability of
  * database corruption to a values closer to the LMDB. */
-#ifndef MDBX_DISABLE_PAGECHECKS
-#define MDBX_DISABLE_PAGECHECKS 0
-#elif !(MDBX_DISABLE_PAGECHECKS == 0 || MDBX_DISABLE_PAGECHECKS == 1)
-#error MDBX_DISABLE_PAGECHECKS must be defined as 0 or 1
-#endif /* MDBX_DISABLE_PAGECHECKS */
+#ifndef MDBX_DISABLE_VALIDATION
+#define MDBX_DISABLE_VALIDATION 0
+#elif !(MDBX_DISABLE_VALIDATION == 0 || MDBX_DISABLE_VALIDATION == 1)
+#error MDBX_DISABLE_VALIDATION must be defined as 0 or 1
+#endif /* MDBX_DISABLE_VALIDATION */
 
 #ifndef MDBX_PNL_PREALLOC_FOR_RADIXSORT
 #define MDBX_PNL_PREALLOC_FOR_RADIXSORT 1
@@ -181,6 +193,25 @@
  *  otherwise detects ones availability automatically. */
 #ifndef MDBX_HAVE_C11ATOMICS
 #endif /* MDBX_HAVE_C11ATOMICS */
+
+/** If defined then enables use the GCC's `__builtin_cpu_supports()`
+ *  for runtime dispatching depending on the CPU's capabilities. */
+#ifndef MDBX_HAVE_BUILTIN_CPU_SUPPORTS
+#if defined(__APPLE__) || defined(BIONIC)
+/* Never use any modern features on Apple's or Google's OSes
+ * since a lot of troubles with compatibility and/or performance */
+#define MDBX_HAVE_BUILTIN_CPU_SUPPORTS 0
+#elif __has_builtin(__builtin_cpu_supports) ||                                 \
+    defined(__BUILTIN_CPU_SUPPORTS__) ||                                       \
+    (defined(__ia32__) && __GNUC_PREREQ(4, 8) && __GLIBC_PREREQ(2, 23))
+#define MDBX_HAVE_BUILTIN_CPU_SUPPORTS 1
+#else
+#define MDBX_HAVE_BUILTIN_CPU_SUPPORTS 0
+#endif
+#elif !(MDBX_HAVE_BUILTIN_CPU_SUPPORTS == 0 ||                                 \
+        MDBX_HAVE_BUILTIN_CPU_SUPPORTS == 1)
+#error MDBX_HAVE_BUILTIN_CPU_SUPPORTS must be defined as 0 or 1
+#endif /* MDBX_HAVE_BUILTIN_CPU_SUPPORTS */
 
 //------------------------------------------------------------------------------
 
@@ -352,14 +383,11 @@
 #endif /* MDBX_64BIT_CAS */
 
 #ifndef MDBX_UNALIGNED_OK
-#if defined(__ALIGNED__) || defined(__SANITIZE_UNDEFINED__)
+#if defined(__ALIGNED__) || defined(__SANITIZE_UNDEFINED__) ||                 \
+    defined(ENABLE_UBSAN)
 #define MDBX_UNALIGNED_OK 0 /* no unaligned access allowed */
 #elif defined(__ARM_FEATURE_UNALIGNED)
 #define MDBX_UNALIGNED_OK 4 /* ok unaligned for 32-bit words */
-#elif __CLANG_PREREQ(5, 0) || __GNUC_PREREQ(5, 0)
-/* expecting an optimization will well done, also this
- * hushes false-positives from UBSAN (undefined behaviour sanitizer) */
-#define MDBX_UNALIGNED_OK 0
 #elif defined(__e2k__) || defined(__elbrus__)
 #if __iset__ > 4
 #define MDBX_UNALIGNED_OK 8 /* ok unaligned for 64-bit words */
@@ -368,6 +396,10 @@
 #endif
 #elif defined(__ia32__)
 #define MDBX_UNALIGNED_OK 8 /* ok unaligned for 64-bit words */
+#elif __CLANG_PREREQ(5, 0) || __GNUC_PREREQ(5, 0)
+/* expecting an optimization will well done, also this
+ * hushes false-positives from UBSAN (undefined behaviour sanitizer) */
+#define MDBX_UNALIGNED_OK 0
 #else
 #define MDBX_UNALIGNED_OK 0 /* no unaligned access allowed */
 #endif

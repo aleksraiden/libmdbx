@@ -28,10 +28,11 @@
 #include <sys/utsname.h>
 
 #ifndef xMDBX_ALLOY
-uint32_t mdbx_linux_kernel_version;
+uint32_t linux_kernel_version;
 bool mdbx_RunningOnWSL1;
 #endif /* xMDBX_ALLOY */
 
+MDBX_EXCLUDE_FOR_GPROF
 __cold static uint8_t probe_for_WSL(const char *tag) {
   const char *const WSL = strstr(tag, "WSL");
   if (WSL && WSL[3] >= '2' && WSL[3] <= '9')
@@ -42,14 +43,28 @@ __cold static uint8_t probe_for_WSL(const char *tag) {
   if (WSL || wsl || strcasestr(tag, "Microsoft"))
     /* Expecting no new kernel within WSL1, either it will explicitly
      * marked by an appropriate WSL-version hint. */
-    return (mdbx_linux_kernel_version < /* 4.19.x */ 0x04130000) ? 1 : 2;
+    return (linux_kernel_version < /* 4.19.x */ 0x04130000) ? 1 : 2;
   return 0;
 }
 
 #endif /* Linux */
 
+#ifdef ENABLE_GPROF
+extern void _mcleanup(void);
+extern void monstartup(unsigned long, unsigned long);
+extern void _init(void);
+extern void _fini(void);
+extern void __gmon_start__(void) __attribute__((__weak__));
+#endif /* ENABLE_GPROF */
+
+MDBX_EXCLUDE_FOR_GPROF
 __cold static __attribute__((__constructor__)) void
 mdbx_global_constructor(void) {
+#ifdef ENABLE_GPROF
+  if (!&__gmon_start__)
+    monstartup((uintptr_t)&_init, (uintptr_t)&_fini);
+#endif /* ENABLE_GPROF */
+
 #if defined(__linux__) || defined(__gnu_linux__)
   struct utsname buffer;
   if (uname(&buffer) == 0) {
@@ -61,7 +76,7 @@ mdbx_global_constructor(void) {
         if (number > 0) {
           if (number > 255)
             number = 255;
-          mdbx_linux_kernel_version += number << (24 - i * 8);
+          linux_kernel_version += number << (24 - i * 8);
         }
         ++i;
       } else {
@@ -81,12 +96,17 @@ mdbx_global_constructor(void) {
   }
 #endif /* Linux */
 
-  mdbx_rthc_global_init();
+  global_ctor();
 }
 
+MDBX_EXCLUDE_FOR_GPROF
 __cold static __attribute__((__destructor__)) void
 mdbx_global_destructor(void) {
-  mdbx_rthc_global_dtor();
+  global_dtor();
+#ifdef ENABLE_GPROF
+  if (!&__gmon_start__)
+    _mcleanup();
+#endif /* ENABLE_GPROF */
 }
 
 /*----------------------------------------------------------------------------*/
@@ -98,15 +118,15 @@ mdbx_global_destructor(void) {
  * размещаются совместно используемые posix-мьютексы (futex). Посредством
  * этих мьютексов (см struct MDBX_lockinfo) реализуются:
  *  - Блокировка таблицы читателей для регистрации,
- *    т.е. функции mdbx_rdt_lock() и mdbx_rdt_unlock().
+ *    т.е. функции osal_rdt_lock() и osal_rdt_unlock().
  *  - Блокировка БД для пишущих транзакций,
  *    т.е. функции mdbx_txn_lock() и mdbx_txn_unlock().
  *
  * Остальной функционал реализуется отдельно посредством файловых блокировок:
  *  - Первоначальный захват БД в режиме exclusive/shared и последующий перевод
- *    в операционный режим, функции mdbx_lck_seize() и mdbx_lck_downgrade().
+ *    в операционный режим, функции osal_lck_seize() и osal_lck_downgrade().
  *  - Проверка присутствие процессов-читателей,
- *    т.е. функции mdbx_rpid_set(), mdbx_rpid_clear() и mdbx_rpid_check().
+ *    т.е. функции osal_rpid_set(), osal_rpid_clear() и osal_rpid_check().
  *
  * Для блокировки файлов используется fcntl(F_SETLK), так как:
  *  - lockf() оперирует только эксклюзивной блокировкой и требует
@@ -133,7 +153,7 @@ mdbx_global_destructor(void) {
  *    lck-файла:
  *       + для НЕ-эксклюзивного режима блокировка pid-байта в dxb-файле
  *         посредством F_RDLCK или F_WRLCK, в зависимости от MDBX_RDONLY.
- *       + для ЭКСКЛЮЗИВНОГО режима блокировка pid-байта всего dxb-файла
+ *       + для ЭКСКЛЮЗИВНОГО режима блокировка всего dxb-файла
  *         посредством F_RDLCK или F_WRLCK, в зависимости от MDBX_RDONLY.
  *
  * ОПЕРАЦИОННЫЙ режим с lck-файлом:
@@ -150,9 +170,9 @@ mdbx_global_destructor(void) {
 static int op_setlk, op_setlkw, op_getlk;
 __cold static void choice_fcntl(void) {
   assert(!op_setlk && !op_setlkw && !op_getlk);
-  if ((mdbx_runtime_flags & MDBX_DBG_LEGACY_MULTIOPEN) == 0
+  if ((runtime_flags & MDBX_DBG_LEGACY_MULTIOPEN) == 0
 #if defined(__linux__) || defined(__gnu_linux__)
-      && mdbx_linux_kernel_version >
+      && linux_kernel_version >
              0x030f0000 /* OFD locks are available since 3.15, but engages here
                            only for 3.16 and later kernels (i.e. LTS) because
                            of reliability reasons */
@@ -187,7 +207,7 @@ static int lck_op(const mdbx_filehandle_t fd, int cmd, const int lck,
                     "The bitness of system `off_t` type is mismatch. Please "
                     "fix build and/or NDK configuration.");
 #endif /* Android */
-  mdbx_jitter4testing(true);
+  jitter4testing(true);
   assert(offset >= 0 && len > 0);
   assert((uint64_t)offset < (uint64_t)INT64_MAX &&
          (uint64_t)len < (uint64_t)INT64_MAX &&
@@ -201,16 +221,19 @@ static int lck_op(const mdbx_filehandle_t fd, int cmd, const int lck,
          ((uint64_t)offset + (uint64_t)len));
   for (;;) {
     struct flock lock_op;
-    STATIC_ASSERT(sizeof(off_t) <= sizeof(lock_op.l_start) &&
-                  sizeof(off_t) <= sizeof(lock_op.l_len) &&
-                  OFF_T_MAX == (off_t)OFF_T_MAX);
+    STATIC_ASSERT_MSG(sizeof(off_t) <= sizeof(lock_op.l_start) &&
+                          sizeof(off_t) <= sizeof(lock_op.l_len) &&
+                          OFF_T_MAX == (off_t)OFF_T_MAX,
+                      "Support for large/64-bit-sized files is misconfigured "
+                      "for the target system and/or toolchain. "
+                      "Please fix it or at least disable it completely.");
     memset(&lock_op, 0, sizeof(lock_op));
     lock_op.l_type = lck;
     lock_op.l_whence = SEEK_SET;
     lock_op.l_start = offset;
     lock_op.l_len = len;
     int rc = fcntl(fd, cmd, &lock_op);
-    mdbx_jitter4testing(true);
+    jitter4testing(true);
     if (rc != -1) {
       if (cmd == op_getlk) {
         /* Checks reader by pid. Returns:
@@ -245,7 +268,7 @@ static int lck_op(const mdbx_filehandle_t fd, int cmd, const int lck,
   }
 }
 
-MDBX_INTERNAL_FUNC int mdbx_lockfile(mdbx_filehandle_t fd, bool wait) {
+MDBX_INTERNAL_FUNC int osal_lockfile(mdbx_filehandle_t fd, bool wait) {
 #if MDBX_USE_OFDLOCKS
   if (unlikely(op_setlk == 0))
     choice_fcntl();
@@ -253,21 +276,21 @@ MDBX_INTERNAL_FUNC int mdbx_lockfile(mdbx_filehandle_t fd, bool wait) {
   return lck_op(fd, wait ? op_setlkw : op_setlk, F_WRLCK, 0, OFF_T_MAX);
 }
 
-MDBX_INTERNAL_FUNC int mdbx_rpid_set(MDBX_env *env) {
+MDBX_INTERNAL_FUNC int osal_rpid_set(MDBX_env *env) {
   assert(env->me_lfd != INVALID_HANDLE_VALUE);
   assert(env->me_pid > 0);
-  if (unlikely(mdbx_getpid() != env->me_pid))
+  if (unlikely(osal_getpid() != env->me_pid))
     return MDBX_PANIC;
   return lck_op(env->me_lfd, op_setlk, F_WRLCK, env->me_pid, 1);
 }
 
-MDBX_INTERNAL_FUNC int mdbx_rpid_clear(MDBX_env *env) {
+MDBX_INTERNAL_FUNC int osal_rpid_clear(MDBX_env *env) {
   assert(env->me_lfd != INVALID_HANDLE_VALUE);
   assert(env->me_pid > 0);
   return lck_op(env->me_lfd, op_setlk, F_UNLCK, env->me_pid, 1);
 }
 
-MDBX_INTERNAL_FUNC int mdbx_rpid_check(MDBX_env *env, uint32_t pid) {
+MDBX_INTERNAL_FUNC int osal_rpid_check(MDBX_env *env, uint32_t pid) {
   assert(env->me_lfd != INVALID_HANDLE_VALUE);
   assert(pid > 0);
   return lck_op(env->me_lfd, op_getlk, F_WRLCK, pid, 1);
@@ -276,7 +299,7 @@ MDBX_INTERNAL_FUNC int mdbx_rpid_check(MDBX_env *env, uint32_t pid) {
 /*---------------------------------------------------------------------------*/
 
 #if MDBX_LOCKING > MDBX_LOCKING_SYSV
-MDBX_INTERNAL_FUNC int mdbx_ipclock_stub(mdbx_ipclock_t *ipc) {
+MDBX_INTERNAL_FUNC int osal_ipclock_stub(osal_ipclock_t *ipc) {
 #if MDBX_LOCKING == MDBX_LOCKING_POSIX1988
   return sem_init(ipc, false, 1) ? errno : 0;
 #elif MDBX_LOCKING == MDBX_LOCKING_POSIX2001 ||                                \
@@ -287,7 +310,7 @@ MDBX_INTERNAL_FUNC int mdbx_ipclock_stub(mdbx_ipclock_t *ipc) {
 #endif
 }
 
-MDBX_INTERNAL_FUNC int mdbx_ipclock_destroy(mdbx_ipclock_t *ipc) {
+MDBX_INTERNAL_FUNC int osal_ipclock_destroy(osal_ipclock_t *ipc) {
 #if MDBX_LOCKING == MDBX_LOCKING_POSIX1988
   return sem_destroy(ipc) ? errno : 0;
 #elif MDBX_LOCKING == MDBX_LOCKING_POSIX2001 ||                                \
@@ -305,7 +328,7 @@ static int check_fstat(MDBX_env *env) {
   int rc = MDBX_SUCCESS;
   if (fstat(env->me_lazy_fd, &st)) {
     rc = errno;
-    mdbx_error("fstat(%s), err %d", "DXB", rc);
+    ERROR("fstat(%s), err %d", "DXB", rc);
     return rc;
   }
 
@@ -315,15 +338,14 @@ static int check_fstat(MDBX_env *env) {
 #else
     rc = EPERM;
 #endif
-    mdbx_error("%s %s, err %d", "DXB",
-               (st.st_nlink < 1) ? "file was removed" : "not a regular file",
-               rc);
+    ERROR("%s %s, err %d", "DXB",
+          (st.st_nlink < 1) ? "file was removed" : "not a regular file", rc);
     return rc;
   }
 
   if (st.st_size < (off_t)(MDBX_MIN_PAGESIZE * NUM_METAS)) {
-    mdbx_verbose("dxb-file is too short (%u), exclusive-lock needed",
-                 (unsigned)st.st_size);
+    VERBOSE("dxb-file is too short (%u), exclusive-lock needed",
+            (unsigned)st.st_size);
     rc = MDBX_RESULT_TRUE;
   }
 
@@ -331,7 +353,7 @@ static int check_fstat(MDBX_env *env) {
 
   if (fstat(env->me_lfd, &st)) {
     rc = errno;
-    mdbx_error("fstat(%s), err %d", "LCK", rc);
+    ERROR("fstat(%s), err %d", "LCK", rc);
     return rc;
   }
 
@@ -341,26 +363,25 @@ static int check_fstat(MDBX_env *env) {
 #else
     rc = EPERM;
 #endif
-    mdbx_error("%s %s, err %d", "LCK",
-               (st.st_nlink < 1) ? "file was removed" : "not a regular file",
-               rc);
+    ERROR("%s %s, err %d", "LCK",
+          (st.st_nlink < 1) ? "file was removed" : "not a regular file", rc);
     return rc;
   }
 
   /* Checking file size for detect the situation when we got the shared lock
-   * immediately after mdbx_lck_destroy(). */
+   * immediately after osal_lck_destroy(). */
   if (st.st_size < (off_t)(sizeof(MDBX_lockinfo) + sizeof(MDBX_reader))) {
-    mdbx_verbose("lck-file is too short (%u), exclusive-lock needed",
-                 (unsigned)st.st_size);
+    VERBOSE("lck-file is too short (%u), exclusive-lock needed",
+            (unsigned)st.st_size);
     rc = MDBX_RESULT_TRUE;
   }
 
   return rc;
 }
 
-__cold MDBX_INTERNAL_FUNC int mdbx_lck_seize(MDBX_env *env) {
+__cold MDBX_INTERNAL_FUNC int osal_lck_seize(MDBX_env *env) {
   assert(env->me_lazy_fd != INVALID_HANDLE_VALUE);
-  if (unlikely(mdbx_getpid() != env->me_pid))
+  if (unlikely(osal_getpid() != env->me_pid))
     return MDBX_PANIC;
 #if MDBX_USE_OFDLOCKS
   if (unlikely(op_setlk == 0))
@@ -371,10 +392,10 @@ __cold MDBX_INTERNAL_FUNC int mdbx_lck_seize(MDBX_env *env) {
 #if defined(__linux__) || defined(__gnu_linux__)
   if (unlikely(mdbx_RunningOnWSL1)) {
     rc = ENOLCK /* No record locks available */;
-    mdbx_error("%s, err %u",
-               "WSL1 (Windows Subsystem for Linux) is mad and trouble-full, "
-               "injecting failure to avoid data loss",
-               rc);
+    ERROR("%s, err %u",
+          "WSL1 (Windows Subsystem for Linux) is mad and trouble-full, "
+          "injecting failure to avoid data loss",
+          rc);
     return rc;
   }
 #endif /* Linux */
@@ -385,8 +406,8 @@ __cold MDBX_INTERNAL_FUNC int mdbx_lck_seize(MDBX_env *env) {
         lck_op(env->me_lazy_fd, op_setlk,
                (env->me_flags & MDBX_RDONLY) ? F_RDLCK : F_WRLCK, 0, OFF_T_MAX);
     if (rc != MDBX_SUCCESS) {
-      mdbx_error("%s, err %u", "without-lck", rc);
-      mdbx_assert(env, MDBX_IS_ERROR(rc));
+      ERROR("%s, err %u", "without-lck", rc);
+      eASSERT(env, MDBX_IS_ERROR(rc));
       return rc;
     }
     return MDBX_RESULT_TRUE /* Done: return with exclusive locking. */;
@@ -399,8 +420,8 @@ retry:
   if (rc == MDBX_RESULT_TRUE) {
     rc = lck_op(env->me_lfd, op_setlk, F_UNLCK, 0, 1);
     if (rc != MDBX_SUCCESS) {
-      mdbx_error("%s, err %u", "unlock-before-retry", rc);
-      mdbx_assert(env, MDBX_IS_ERROR(rc));
+      ERROR("%s, err %u", "unlock-before-retry", rc);
+      eASSERT(env, MDBX_IS_ERROR(rc));
       return rc;
     }
   }
@@ -426,23 +447,23 @@ retry:
     /* the cause may be a collision with POSIX's file-lock recovery. */
     if (!(rc == EAGAIN || rc == EACCES || rc == EBUSY || rc == EWOULDBLOCK ||
           rc == EDEADLK)) {
-      mdbx_error("%s, err %u", "dxb-exclusive", rc);
-      mdbx_assert(env, MDBX_IS_ERROR(rc));
+      ERROR("%s, err %u", "dxb-exclusive", rc);
+      eASSERT(env, MDBX_IS_ERROR(rc));
       return rc;
     }
 
     /* Fallback to lck-shared */
   } else if (!(rc == EAGAIN || rc == EACCES || rc == EBUSY ||
                rc == EWOULDBLOCK || rc == EDEADLK)) {
-    mdbx_error("%s, err %u", "try-exclusive", rc);
-    mdbx_assert(env, MDBX_IS_ERROR(rc));
+    ERROR("%s, err %u", "try-exclusive", rc);
+    eASSERT(env, MDBX_IS_ERROR(rc));
     return rc;
   }
 
   /* Here could be one of two:
-   *  - mdbx_lck_destroy() from the another process was hold the lock
+   *  - osal_lck_destroy() from the another process was hold the lock
    *    during a destruction.
-   *  - either mdbx_lck_seize() from the another process was got the exclusive
+   *  - either osal_lck_seize() from the another process was got the exclusive
    *    lock and doing initialization.
    * For distinguish these cases will use size of the lck-file later. */
 
@@ -451,8 +472,8 @@ retry:
    * competing process doesn't call lck_downgrade(). */
   rc = lck_op(env->me_lfd, op_setlkw, F_RDLCK, 0, 1);
   if (rc != MDBX_SUCCESS) {
-    mdbx_error("%s, err %u", "try-shared", rc);
-    mdbx_assert(env, MDBX_IS_ERROR(rc));
+    ERROR("%s, err %u", "try-shared", rc);
+    eASSERT(env, MDBX_IS_ERROR(rc));
     return rc;
   }
 
@@ -460,7 +481,7 @@ retry:
   if (rc == MDBX_RESULT_TRUE)
     goto retry;
   if (rc != MDBX_SUCCESS) {
-    mdbx_error("%s, err %u", "lck_fstat", rc);
+    ERROR("%s, err %u", "lck_fstat", rc);
     return rc;
   }
 
@@ -471,8 +492,8 @@ retry:
 
   if (!(rc == EAGAIN || rc == EACCES || rc == EBUSY || rc == EWOULDBLOCK ||
         rc == EDEADLK)) {
-    mdbx_error("%s, err %u", "try-exclusive", rc);
-    mdbx_assert(env, MDBX_IS_ERROR(rc));
+    ERROR("%s, err %u", "try-exclusive", rc);
+    eASSERT(env, MDBX_IS_ERROR(rc));
     return rc;
   }
 
@@ -481,8 +502,8 @@ retry:
       lck_op(env->me_lazy_fd, op_setlk,
              (env->me_flags & MDBX_RDONLY) ? F_RDLCK : F_WRLCK, env->me_pid, 1);
   if (rc != MDBX_SUCCESS) {
-    mdbx_error("%s, err %u", "lock-against-without-lck", rc);
-    mdbx_assert(env, MDBX_IS_ERROR(rc));
+    ERROR("%s, err %u", "lock-against-without-lck", rc);
+    eASSERT(env, MDBX_IS_ERROR(rc));
     return rc;
   }
 
@@ -490,9 +511,9 @@ retry:
   return MDBX_RESULT_FALSE;
 }
 
-MDBX_INTERNAL_FUNC int mdbx_lck_downgrade(MDBX_env *env) {
+MDBX_INTERNAL_FUNC int osal_lck_downgrade(MDBX_env *env) {
   assert(env->me_lfd != INVALID_HANDLE_VALUE);
-  if (unlikely(mdbx_getpid() != env->me_pid))
+  if (unlikely(osal_getpid() != env->me_pid))
     return MDBX_PANIC;
 
   int rc = MDBX_SUCCESS;
@@ -505,15 +526,15 @@ MDBX_INTERNAL_FUNC int mdbx_lck_downgrade(MDBX_env *env) {
   if (rc == MDBX_SUCCESS)
     rc = lck_op(env->me_lfd, op_setlk, F_RDLCK, 0, 1);
   if (unlikely(rc != 0)) {
-    mdbx_error("%s, err %u", "lck", rc);
+    ERROR("%s, err %u", "lck", rc);
     assert(MDBX_IS_ERROR(rc));
   }
   return rc;
 }
 
-__cold MDBX_INTERNAL_FUNC int mdbx_lck_destroy(MDBX_env *env,
+__cold MDBX_INTERNAL_FUNC int osal_lck_destroy(MDBX_env *env,
                                                MDBX_env *inprocess_neighbor) {
-  if (unlikely(mdbx_getpid() != env->me_pid))
+  if (unlikely(osal_getpid() != env->me_pid))
     return MDBX_PANIC;
 
   int rc = MDBX_SUCCESS;
@@ -528,25 +549,25 @@ __cold MDBX_INTERNAL_FUNC int mdbx_lck_destroy(MDBX_env *env,
              (env->me_flags & MDBX_RDONLY) ? F_RDLCK : F_WRLCK, 0,
              OFF_T_MAX) == 0) {
 
-    mdbx_verbose("%p got exclusive, drown locks", (void *)env);
+    VERBOSE("%p got exclusive, drown locks", (void *)env);
 #if MDBX_LOCKING == MDBX_LOCKING_SYSV
     if (env->me_sysv_ipc.semid != -1)
       rc = semctl(env->me_sysv_ipc.semid, 2, IPC_RMID) ? errno : 0;
 #else
-    rc = mdbx_ipclock_destroy(&lck->mti_rlock);
+    rc = osal_ipclock_destroy(&lck->mti_rlock);
     if (rc == 0)
-      rc = mdbx_ipclock_destroy(&lck->mti_wlock);
+      rc = osal_ipclock_destroy(&lck->mti_wlock);
 #endif /* MDBX_LOCKING */
 
-    mdbx_assert(env, rc == 0);
+    eASSERT(env, rc == 0);
     if (rc == 0) {
       const bool synced = lck->mti_unsynced_pages.weak == 0;
-      mdbx_munmap(&env->me_lck_mmap);
+      osal_munmap(&env->me_lck_mmap);
       if (synced)
         rc = ftruncate(env->me_lfd, 0) ? errno : 0;
     }
 
-    mdbx_jitter4testing(false);
+    jitter4testing(false);
   }
 
   /* 1) POSIX's fcntl() locks (i.e. when op_setlk == F_SETLK) should be restored
@@ -587,7 +608,7 @@ __cold MDBX_INTERNAL_FUNC int mdbx_lck_destroy(MDBX_env *env,
       /* restore file-locks */
       rc = lck_op(inprocess_neighbor->me_lfd, F_SETLKW, F_RDLCK, 0, 1);
       if (rc == MDBX_SUCCESS && inprocess_neighbor->me_live_reader)
-        rc = mdbx_rpid_set(inprocess_neighbor);
+        rc = osal_rpid_set(inprocess_neighbor);
     }
   }
 
@@ -598,7 +619,7 @@ __cold MDBX_INTERNAL_FUNC int mdbx_lck_destroy(MDBX_env *env,
 
 /*---------------------------------------------------------------------------*/
 
-__cold MDBX_INTERNAL_FUNC int mdbx_lck_init(MDBX_env *env,
+__cold MDBX_INTERNAL_FUNC int osal_lck_init(MDBX_env *env,
                                             MDBX_env *inprocess_neighbor,
                                             int global_uniqueness_flag) {
 #if MDBX_LOCKING == MDBX_LOCKING_SYSV
@@ -745,7 +766,7 @@ bailout:
 #endif /* MDBX_LOCKING > 0 */
 }
 
-__cold static int mdbx_ipclock_failed(MDBX_env *env, mdbx_ipclock_t *ipc,
+__cold static int mdbx_ipclock_failed(MDBX_env *env, osal_ipclock_t *ipc,
                                       const int err) {
   int rc = err;
 #if MDBX_LOCKING == MDBX_LOCKING_POSIX2008 || MDBX_LOCKING == MDBX_LOCKING_SYSV
@@ -762,10 +783,10 @@ __cold static int mdbx_ipclock_failed(MDBX_env *env, mdbx_ipclock_t *ipc,
         rc = MDBX_PANIC;
       }
     }
-    mdbx_warning("%clock owner died, %s", (rlocked ? 'r' : 'w'),
-                 (rc ? "this process' env is hosed" : "recovering"));
+    WARNING("%clock owner died, %s", (rlocked ? 'r' : 'w'),
+            (rc ? "this process' env is hosed" : "recovering"));
 
-    int check_rc = mdbx_cleanup_dead_readers(env, rlocked, NULL);
+    int check_rc = cleanup_dead_readers(env, rlocked, NULL);
     check_rc = (check_rc == MDBX_SUCCESS) ? MDBX_RESULT_TRUE : check_rc;
 
 #if MDBX_LOCKING == MDBX_LOCKING_SYSV
@@ -783,7 +804,7 @@ __cold static int mdbx_ipclock_failed(MDBX_env *env, mdbx_ipclock_t *ipc,
     check_rc = (mreco_rc == 0) ? check_rc : mreco_rc;
 
     if (unlikely(mreco_rc))
-      mdbx_error("lock recovery failed, %s", mdbx_strerror(mreco_rc));
+      ERROR("lock recovery failed, %s", mdbx_strerror(mreco_rc));
 
     rc = (rc == MDBX_SUCCESS) ? check_rc : rc;
     if (MDBX_IS_ERROR(rc))
@@ -806,24 +827,24 @@ __cold static int mdbx_ipclock_failed(MDBX_env *env, mdbx_ipclock_t *ipc,
 #error "FIXME"
 #endif /* MDBX_LOCKING */
 
-  mdbx_error("mutex (un)lock failed, %s", mdbx_strerror(err));
+  ERROR("mutex (un)lock failed, %s", mdbx_strerror(err));
   if (rc != EDEADLK)
     env->me_flags |= MDBX_FATAL_ERROR;
   return rc;
 }
 
 #if defined(__ANDROID_API__) || defined(ANDROID) || defined(BIONIC)
-MDBX_INTERNAL_FUNC int mdbx_check_tid4bionic(void) {
+MDBX_INTERNAL_FUNC int osal_check_tid4bionic(void) {
   /* avoid 32-bit Bionic bug/hang with 32-pit TID */
   if (sizeof(pthread_mutex_t) < sizeof(pid_t) + sizeof(unsigned)) {
     pid_t tid = gettid();
     if (unlikely(tid > 0xffff)) {
-      mdbx_fatal("Raise the ENOSYS(%d) error to avoid hang due "
-                 "the 32-bit Bionic/Android bug with tid/thread_id 0x%08x(%i) "
-                 "that don’t fit in 16 bits, see "
-                 "https://android.googlesource.com/platform/bionic/+/master/"
-                 "docs/32-bit-abi.md#is-too-small-for-large-pids",
-                 ENOSYS, tid, tid);
+      FATAL("Raise the ENOSYS(%d) error to avoid hang due "
+            "the 32-bit Bionic/Android bug with tid/thread_id 0x%08x(%i) "
+            "that don’t fit in 16 bits, see "
+            "https://android.googlesource.com/platform/bionic/+/master/"
+            "docs/32-bit-abi.md#is-too-small-for-large-pids",
+            ENOSYS, tid, tid);
       return ENOSYS;
     }
   }
@@ -831,11 +852,11 @@ MDBX_INTERNAL_FUNC int mdbx_check_tid4bionic(void) {
 }
 #endif /* __ANDROID_API__ || ANDROID) || BIONIC */
 
-static int mdbx_ipclock_lock(MDBX_env *env, mdbx_ipclock_t *ipc,
+static int mdbx_ipclock_lock(MDBX_env *env, osal_ipclock_t *ipc,
                              const bool dont_wait) {
 #if MDBX_LOCKING == MDBX_LOCKING_POSIX2001 ||                                  \
     MDBX_LOCKING == MDBX_LOCKING_POSIX2008
-  int rc = mdbx_check_tid4bionic();
+  int rc = osal_check_tid4bionic();
   if (likely(rc == 0))
     rc = dont_wait ? pthread_mutex_trylock(ipc) : pthread_mutex_lock(ipc);
   rc = (rc == EBUSY && dont_wait) ? MDBX_BUSY : rc;
@@ -871,7 +892,7 @@ static int mdbx_ipclock_lock(MDBX_env *env, mdbx_ipclock_t *ipc,
   return rc;
 }
 
-static int mdbx_ipclock_unlock(MDBX_env *env, mdbx_ipclock_t *ipc) {
+static int mdbx_ipclock_unlock(MDBX_env *env, osal_ipclock_t *ipc) {
 #if MDBX_LOCKING == MDBX_LOCKING_POSIX2001 ||                                  \
     MDBX_LOCKING == MDBX_LOCKING_POSIX2008
   int rc = pthread_mutex_unlock(ipc);
@@ -893,38 +914,38 @@ static int mdbx_ipclock_unlock(MDBX_env *env, mdbx_ipclock_t *ipc) {
   return rc;
 }
 
-MDBX_INTERNAL_FUNC int mdbx_rdt_lock(MDBX_env *env) {
-  mdbx_trace("%s", ">>");
-  mdbx_jitter4testing(true);
+MDBX_INTERNAL_FUNC int osal_rdt_lock(MDBX_env *env) {
+  TRACE("%s", ">>");
+  jitter4testing(true);
   int rc = mdbx_ipclock_lock(env, &env->me_lck->mti_rlock, false);
-  mdbx_trace("<< rc %d", rc);
+  TRACE("<< rc %d", rc);
   return rc;
 }
 
-MDBX_INTERNAL_FUNC void mdbx_rdt_unlock(MDBX_env *env) {
-  mdbx_trace("%s", ">>");
+MDBX_INTERNAL_FUNC void osal_rdt_unlock(MDBX_env *env) {
+  TRACE("%s", ">>");
   int rc = mdbx_ipclock_unlock(env, &env->me_lck->mti_rlock);
-  mdbx_trace("<< rc %d", rc);
+  TRACE("<< rc %d", rc);
   if (unlikely(rc != MDBX_SUCCESS))
     mdbx_panic("%s() failed: err %d\n", __func__, rc);
-  mdbx_jitter4testing(true);
+  jitter4testing(true);
 }
 
 int mdbx_txn_lock(MDBX_env *env, bool dont_wait) {
-  mdbx_trace("%swait %s", dont_wait ? "dont-" : "", ">>");
-  mdbx_jitter4testing(true);
+  TRACE("%swait %s", dont_wait ? "dont-" : "", ">>");
+  jitter4testing(true);
   int rc = mdbx_ipclock_lock(env, &env->me_lck->mti_wlock, dont_wait);
-  mdbx_trace("<< rc %d", rc);
+  TRACE("<< rc %d", rc);
   return MDBX_IS_ERROR(rc) ? rc : MDBX_SUCCESS;
 }
 
 void mdbx_txn_unlock(MDBX_env *env) {
-  mdbx_trace("%s", ">>");
+  TRACE("%s", ">>");
   int rc = mdbx_ipclock_unlock(env, &env->me_lck->mti_wlock);
-  mdbx_trace("<< rc %d", rc);
+  TRACE("<< rc %d", rc);
   if (unlikely(rc != MDBX_SUCCESS))
     mdbx_panic("%s() failed: err %d\n", __func__, rc);
-  mdbx_jitter4testing(true);
+  jitter4testing(true);
 }
 
 #else

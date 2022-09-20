@@ -20,7 +20,7 @@
 #pragma warning(disable : 4996) /* The POSIX name is deprecated... */
 #endif                          /* _MSC_VER (warnings) */
 
-#define xMDBX_TOOLS /* Avoid using internal mdbx_assert() */
+#define xMDBX_TOOLS /* Avoid using internal eASSERT() */
 #include "internals.h"
 
 #include <ctype.h>
@@ -186,10 +186,10 @@ static int dump_sdb(MDBX_txn *txn, MDBX_dbi dbi, char *name) {
     error("mdbx_cursor_open", rc);
     return rc;
   }
-  if (MDBX_DEBUG > 0 && rescue) {
-    cursor->mc_flags |= C_SKIPORD;
+  if (rescue) {
+    cursor->mc_checking |= CC_SKIPORD;
     if (cursor->mc_xcursor)
-      cursor->mc_xcursor->mx_cursor.mc_flags |= C_SKIPORD;
+      cursor->mc_xcursor->mx_cursor.mc_checking |= CC_SKIPORD;
   }
 
   while ((rc = mdbx_cursor_get(cursor, &key, &data, MDBX_NEXT)) ==
@@ -356,7 +356,9 @@ int main(int argc, char *argv[]) {
 
   rc = mdbx_env_open(
       env, envname,
-      envflags | (rescue ? MDBX_RDONLY | MDBX_EXCLUSIVE : MDBX_RDONLY), 0);
+      envflags | (rescue ? MDBX_RDONLY | MDBX_EXCLUSIVE | MDBX_VALIDATION
+                         : MDBX_RDONLY),
+      0);
   if (unlikely(rc != MDBX_SUCCESS)) {
     error("mdbx_env_open", rc);
     goto env_close;
@@ -383,10 +385,10 @@ int main(int argc, char *argv[]) {
       error("mdbx_cursor_open", rc);
       goto txn_abort;
     }
-    if (MDBX_DEBUG > 0 && rescue) {
-      cursor->mc_flags |= C_SKIPORD;
+    if (rescue) {
+      cursor->mc_checking |= CC_SKIPORD;
       if (cursor->mc_xcursor)
-        cursor->mc_xcursor->mx_cursor.mc_flags |= C_SKIPORD;
+        cursor->mc_xcursor->mx_cursor.mc_checking |= CC_SKIPORD;
     }
 
     bool have_raw = false;
@@ -401,7 +403,7 @@ int main(int argc, char *argv[]) {
 
       if (memchr(key.iov_base, '\0', key.iov_len))
         continue;
-      subname = mdbx_realloc(buf4free, key.iov_len + 1);
+      subname = osal_realloc(buf4free, key.iov_len + 1);
       if (!subname) {
         rc = MDBX_ENOMEM;
         break;
