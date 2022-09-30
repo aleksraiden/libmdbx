@@ -2131,6 +2131,8 @@ static int lcklist_detach_locked(MDBX_env *env) {
   do {                                                                         \
   } while (0)
 
+/* *INDENT-OFF* */
+/* clang-format off */
 #define SEARCH_IMPL(NAME, TYPE_LIST, TYPE_ARG, CMP)                            \
   static __always_inline const TYPE_LIST *NAME(                                \
       const TYPE_LIST *it, unsigned length, const TYPE_ARG item) {             \
@@ -2178,6 +2180,8 @@ static int lcklist_detach_locked(MDBX_env *env) {
                                                                                \
     return it;                                                                 \
   }
+/* *INDENT-ON* */
+/* clang-format on */
 
 /*----------------------------------------------------------------------------*/
 
@@ -5901,16 +5905,27 @@ MDBX_MAYBE_UNUSED static const pgno_t *scan4range_checker(const MDBX_PNL pnl,
 
 #if defined(_MSC_VER) && !defined(__builtin_clz) &&                            \
     !__has_builtin(__builtin_clz)
-MDBX_MAYBE_UNUSED static __always_inline size_t __builtin_clz(unsigned value) {
+MDBX_MAYBE_UNUSED static __always_inline size_t __builtin_clz(uint32_t value) {
   unsigned long index;
   _BitScanReverse(&index, value);
-  return index;
+  return 31 - index;
 }
 #endif /* _MSC_VER */
 
 #if defined(_MSC_VER) && !defined(__builtin_clzl) &&                           \
     !__has_builtin(__builtin_clzl)
-#define __builtin_clzl(value) __builtin_clz(value)
+MDBX_MAYBE_UNUSED static __always_inline size_t __builtin_clzl(size_t value) {
+  unsigned long index;
+#ifdef _WIN64
+  assert(sizeof(value) == 8);
+  _BitScanReverse64(&index, value);
+  return 63 - index;
+#else
+  assert(sizeof(value) == 4);
+  _BitScanReverse(&index, value);
+  return 31 - index;
+#endif
+}
 #endif /* _MSC_VER */
 
 #if !defined(MDBX_ATTRIBUTE_TARGET) &&                                         \
@@ -11485,6 +11500,27 @@ lckless_stub(const MDBX_env *env) {
 }
 
 __cold int mdbx_env_create(MDBX_env **penv) {
+  if (unlikely(!penv))
+    return MDBX_EINVAL;
+  *penv = nullptr;
+
+  const size_t os_psize = osal_syspagesize();
+  if (unlikely(!is_powerof2(os_psize) || os_psize < MIN_PAGESIZE)) {
+    ERROR("unsuitable system pagesize %" PRIuPTR, os_psize);
+    return MDBX_INCOMPATIBLE;
+  }
+
+#if defined(__linux__) || defined(__gnu_linux__)
+  if (unlikely(linux_kernel_version < 0x04000000)) {
+    /* 2022-09-01: Прошло уже больше двух после окончания какой-либо поддержки
+     * самого "долгоиграющего" ядра 3.16.85 ветки 3.x */
+    ERROR("too old linux kernel %u.%u.%u.%u, the >= 4.0.0 is required",
+          linux_kernel_version >> 24, (linux_kernel_version >> 16) & 255,
+          (linux_kernel_version >> 8) & 255, linux_kernel_version & 255);
+    return MDBX_INCOMPATIBLE;
+  }
+#endif /* Linux */
+
   MDBX_env *env = osal_calloc(1, sizeof(MDBX_env));
   if (unlikely(!env))
     return MDBX_ENOMEM;
@@ -11512,12 +11548,6 @@ __cold int mdbx_env_create(MDBX_env **penv) {
   env->me_options.merge_threshold_16dot16_percent = 65536 / 4 /* 25% */;
 
   int rc;
-  const size_t os_psize = osal_syspagesize();
-  if (unlikely(!is_powerof2(os_psize) || os_psize < MIN_PAGESIZE)) {
-    ERROR("unsuitable system pagesize %" PRIuPTR, os_psize);
-    rc = MDBX_INCOMPATIBLE;
-    goto bailout;
-  }
   env->me_os_psize = (unsigned)os_psize;
   setup_pagesize(env, (env->me_os_psize < MAX_PAGESIZE) ? env->me_os_psize
                                                         : MAX_PAGESIZE);
@@ -11554,7 +11584,6 @@ __cold int mdbx_env_create(MDBX_env **penv) {
 
 bailout:
   osal_free(env);
-  *penv = nullptr;
   return rc;
 }
 
